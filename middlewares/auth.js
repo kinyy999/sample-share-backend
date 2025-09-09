@@ -8,9 +8,16 @@ function authenticateToken(req, res, next) {
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.sendStatus(403); // Forbidden
-    req.user = user;
+    req.user = user; // { userId, role }
     next();
   });
 }
 
-module.exports = authenticateToken;
+function isAdmin(req, res, next) {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access denied: admin only' });
+  }
+  next();
+}
+
+module.exports = { authenticateToken, isAdmin };
