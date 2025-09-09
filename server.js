@@ -10,7 +10,9 @@ const Sample = require('./models/Sample');
 const User = require('./models/User'); // נייבא את מודל המשתמש
 const bcrypt = require('bcrypt'); // להצפנת סיסמאות
 const jwt = require('jsonwebtoken'); // להפקת טוקן JWT
-const authenticateToken = require('./middlewares/auth');
+const { authenticateToken, isAdmin } = require('./middlewares/auth');
+
+
 
 
 // Connect to MongoDB
@@ -23,20 +25,29 @@ mongoose.connect(process.env.MONGO_URI, {
 
 // Middleware
 app.use(express.json());
+const cors = require('cors');
+
+app.use(cors({
+  origin: 'http://localhost:3001', // ה־frontend 
+}));
+
+
+
 
 // Routes
 app.get('/', (req, res) => {
   res.send('✅ SampleShare backend is working!');
 });
 
-app.post('/samples', async (req, res) => {
+app.post('/samples', authenticateToken, async (req, res) => {
   try {
     const sample = new Sample({
       title: req.body.title,
       bpm: req.body.bpm,
       key: req.body.key,
       genre: req.body.genre,
-      url: req.body.url
+      url: req.body.url,
+      owner: req.user.userId
     });
 
     const savedSample = await sample.save();
@@ -47,54 +58,201 @@ app.post('/samples', async (req, res) => {
 });
 
 
-app.get('/samples', authenticateToken, async (req, res) => {
+app.get('/samples', async (req, res) => {
   try {
-    const samples = await Sample.find(); // שולף את כל הסאמפלים
-    res.json(samples); // מחזיר את כולם כ־JSON
+    const { bpm, genre, key, artist, isPublic, page = '1', limit = '20' } = req.query;
+    const query = {};
+
+    if (bpm !== undefined) query.bpm = Number(bpm);
+    if (genre)  query.genre  = new RegExp(`^${genre}$`, 'i');
+    if (key)    query.key    = new RegExp(`^${key}$`, 'i');
+    if (artist) query.artist = new RegExp(artist, 'i');
+    if (isPublic !== undefined) query.isPublic = isPublic === 'true';
+
+    const p = Math.max(1, parseInt(page));
+    const l = Math.min(100, Math.max(1, parseInt(limit)));
+    const skip = (p - 1) * l;
+
+    const [items, total] = await Promise.all([
+      Sample.find(query).sort({ createdAt: -1 }).skip(skip).limit(l),
+      Sample.countDocuments(query)
+    ]);
+
+    res.json({
+      page: p,
+      limit: l,
+      total,
+      pages: Math.ceil(total / l),
+      items
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.put('/samples/:id', async (req, res) => {
+// GET /samples/:id – שליפת פריט יחיד (כולל תגובות עם שם/אימייל הכותב)
+app.get('/samples/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const updatedSample = await Sample.findByIdAndUpdate(
-      id,
-      {
-        title: req.body.title,
-        bpm: req.body.bpm,
-        key: req.body.key,
-        genre: req.body.genre,
-        url: req.body.url,
-      },
-      { new: true } // מחזיר את המסמך החדש אחרי העדכון
-    );
 
-    if (!updatedSample) {
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'invalid sample id' });
+    }
+
+    const sample = await Sample
+      .findById(id)
+      .populate('comments.user', 'username email');
+
+    if (!sample) {
       return res.status(404).json({ error: 'Sample not found' });
     }
 
-    res.json(updatedSample);
+    return res.json(sample);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// עדכון דגימה – מותר לבעלים או לאדמין בלבד
+app.put('/samples/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ולידציית מזהה
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'invalid sample id' });
+    }
+
+    // שליפה כדי לבדוק הרשאות (בעלות)
+    const sample = await Sample.findById(id);
+    if (!sample) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+
+    // הרשאות: בעלים או אדמין
+    const isOwner = sample.owner && sample.owner.toString() === req.user.userId;
+    const isAdmin = req.user.role === 'admin';
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    // עדכון שדות מותרים בלבד
+    const updatable = [
+      'title', 'bpm', 'key', 'genre', 'url',
+      'artist', 'tags', 'length', 'description', 'isPublic'
+    ];
+
+    for (const k of updatable) {
+      if (Object.prototype.hasOwnProperty.call(req.body, k)) {
+        sample[k] = req.body[k];
+      }
+    }
+
+    // שמירה והחזרה
+    const updated = await sample.save();
+    return res.json(updated);
+
+  } catch (err) {
+    // שגיאת ולידציה/אחרות
+    return res.status(400).json({ error: err.message });
   }
 });
 
 
-app.delete('/samples/:id', async (req, res) => {
+// PUT /samples/:sampleId/comments/:commentId – עדכון טקסט של תגובה קיימת (Owner-only)
+app.put('/samples/:sampleId/comments/:commentId', authenticateToken, async (req, res) => {
   try {
-    const deletedSample = await Sample.findByIdAndDelete(req.params.id);
+    const { sampleId, commentId } = req.params;
+    const { text } = req.body || {};
 
-    if (!deletedSample) {
-      return res.status(404).json({ error: 'Sample not found' });
+    if (!mongoose.isValidObjectId(sampleId) || !mongoose.isValidObjectId(commentId)) {
+      return res.status(400).json({ error: 'invalid id' });
+    }
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'text is required' });
     }
 
-    res.json({ message: 'Sample deleted successfully' });
+    const sample = await Sample.findById(sampleId);
+    if (!sample) return res.status(404).json({ error: 'Sample not found' });
+
+    const comment = sample.comments.id(commentId);
+    if (!comment) return res.status(404).json({ error: 'Comment not found' });
+
+    if (comment.user.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    comment.text = text.trim();
+    await sample.save();
+
+    res.json({ message: 'Comment updated', comment });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+
+// DELETE /samples/:id — מותר לבעל ה-Sample או לאדמין
+app.delete('/samples/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ולידציית מזהה
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'invalid sample id' });
+    }
+
+    // שליפה כדי לבדוק בעלות
+    const sample = await Sample.findById(id);
+    if (!sample) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+
+    // הרשאות: בעלים או אדמין
+    const isOwner = sample.owner && sample.owner.toString() === req.user.userId;
+    const isAdmin = req.user.role === 'admin';
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    // מחיקה
+    await sample.deleteOne();
+    return res.json({ message: 'Sample deleted successfully' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
+// DELETE /samples/:sampleId/comments/:commentId – מחיקה של תגובה קיימת
+app.delete('/samples/:sampleId/comments/:commentId', authenticateToken, async (req, res) => {
+  try {
+    const { sampleId, commentId } = req.params;
+
+    if (!mongoose.isValidObjectId(sampleId) || !mongoose.isValidObjectId(commentId)) {
+      return res.status(400).json({ error: 'invalid id' });
+    }
+
+    const sample = await Sample.findById(sampleId);
+    if (!sample) return res.status(404).json({ error: 'Sample not found' });
+
+    const comment = sample.comments.id(commentId);
+    if (!comment) return res.status(404).json({ error: 'Comment not found' });
+
+    // הרשאה: רק בעל התגובה (אותו userId מה־JWT שלך)
+    if (comment.user.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    comment.deleteOne();            // מסיר את התגובה מהמערך
+    await sample.save();            // שומר את הדגימה המעודכנת
+
+    return res.json({ message: 'Comment deleted' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 // Register route
 app.post('/register', async (req, res) => {
@@ -132,23 +290,142 @@ app.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email or password' });
     }
 
+    // ✅ חדש: בדיקה אם המשתמש נעול
+    if (!user.isActive) {
+      return res.status(403).json({ error: 'User account is deactivated' });
+    }
+
     // השוואת סיסמאות
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(400).json({ error: 'Invalid email or password' });
     }
 
-    // יצירת טוקן
-    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
-      expiresIn: '1h',
-    });
+    // יצירת טוקן - כולל גם role
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
 
-    res.json({ token });
+    // החזרת הטוקן וגם ה-role
+    res.json({ token, role: user.role });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+//  הוספת תגובה ל־Sample לפי ID
+app.post('/samples/:id/comments', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { text } = req.body;
+
+    const sample = await Sample.findById(id);
+    if (!sample) return res.status(404).json({ error: 'Sample not found' });
+
+    sample.comments.push({
+      user: req.user.userId,
+      text: text,
+      createdAt: new Date(),
+    });
+
+
+
+    await sample.save({ validateModifiedOnly: true });
+
+    //  ממלאים את מחברי התגובות לפני שמחזירים
+    await sample.populate({ path: 'comments.user', select: 'username email' });
+
+    return res.status(201).json({ message: 'Comment added successfully', sample });
+  } catch (err) {
+    return res.status(500).json({ message: 'Error adding comment', error: err.message });
+  }
+});
+
+
+
+// GET /users – רק אדמין
+app.get('/users', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const users = await User.find().select('-password'); // לא מחזירים סיסמאות
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /users/:id — מחיקת משתמש (Admin-only)
+app.delete('/users/:id', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'invalid user id' });
+    }
+
+    // הגנה: לא מאפשרים לאדמין למחוק את עצמו בטעות
+    if (id === req.user.userId) {
+      return res.status(400).json({ error: 'admin cannot delete self' });
+    }
+
+    const deleted = await User.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ error: 'User not found' });
+
+    res.json({ message: 'User deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /users/:id/role — שינוי role ע"י אדמין בלבד
+app.patch('/users/:id/role', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    // ולידציית מזהה
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'invalid user id' });
+    }
+
+    // ולידציה לערך role
+    if (!['user', 'admin'].includes(role)) {
+      return res.status(400).json({ error: 'role must be user or admin' });
+    }
+
+    // עדכון role
+    const updated = await User.findByIdAndUpdate(id, { role }, { new: true }).select('-password');
+    if (!updated) return res.status(404).json({ error: 'User not found' });
+
+    res.json({ message: 'Role updated successfully', user: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /users/:id/active — שינוי סטטוס חשבון (נעילה/פתיחה) ע"י אדמין
+app.patch('/users/:id/active', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isActive } = req.body;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: 'invalid user id' });
+    }
+
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ error: 'isActive must be true or false' });
+    }
+
+    const updated = await User.findByIdAndUpdate(id, { isActive }, { new: true }).select('-password');
+    if (!updated) return res.status(404).json({ error: 'User not found' });
+
+    res.json({ message: `User ${isActive ? 'activated' : 'deactivated'} successfully`, user: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Start server
 app.listen(PORT, () => {
