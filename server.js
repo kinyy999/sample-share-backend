@@ -12,8 +12,61 @@ const bcrypt = require('bcrypt'); // להצפנת סיסמאות
 const jwt = require('jsonwebtoken'); // להפקת טוקן JWT
 const { authenticateToken, isAdmin } = require('./middlewares/auth');
 
+const multer = require("multer");
+const path = require("path");
 
 
+
+// איפה לשמור את הקבצים
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, "uploads/"),
+  filename: (req, file, cb) =>
+    cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "_")),
+});
+
+// רק סוגי אודיו מותרים
+const audioTypes = /audio\/(mpeg|mp3|wav|x-wav|ogg|aac)/i;
+
+// הגדרות העלאה
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // עד 10MB
+  fileFilter: (req, file, cb) => {
+    if (audioTypes.test(file.mimetype)) return cb(null, true);
+    cb(new Error("Only audio files are allowed"));
+  },
+});
+
+module.exports = upload;
+
+
+const uploadsDir = path.join(__dirname, 'uploads');
+
+app.use(
+  '/uploads',
+  (req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Cross-Origin-Resource-Policy', 'cross-origin');
+    next();
+  },
+  express.static(uploadsDir)
+);
+
+app.get('/download/:id', async (req, res) => {
+  try {
+    const sample = await Sample.findById(req.params.id).lean();
+    if (!sample || !sample.audio) return res.status(404).json({ error: 'file not found' });
+
+    const filePath = path.join(uploadsDir, sample.audio);
+    const niceName =
+      (sample.title ? sample.title.replace(/[^\w.-]+/g, '_') : 'sample') + path.extname(filePath);
+
+    res.header('Access-Control-Allow-Origin', '*');
+    res.download(filePath, niceName);           // ← מכריח הורדה (attachment)
+  } catch (e) {
+    res.status(500).json({ error: 'download failed' });
+  }
+});
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI, {
@@ -39,15 +92,22 @@ app.get('/', (req, res) => {
   res.send('✅ SampleShare backend is working!');
 });
 
-app.post('/samples', authenticateToken, async (req, res) => {
+// החלפה מלאה של הראוט הקיים:
+app.post('/samples', authenticateToken, upload.single('audio'), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: 'audio file is required' });
+
     const sample = new Sample({
       title: req.body.title,
       bpm: req.body.bpm,
       key: req.body.key,
       genre: req.body.genre,
       url: req.body.url,
-      owner: req.user.userId
+      artist: req.body.artist,
+      description: req.body.description,
+      isPublic: req.body.isPublic === 'true',
+      audio: req.file.filename,          // ← שם קובץ האודיו שנשמר ב-uploads/
+      owner: req.user.userId,            // מותאם למה שיש אצלך במידלוור
     });
 
     const savedSample = await sample.save();
@@ -113,42 +173,45 @@ app.get('/samples/:id', async (req, res) => {
   }
 });
 
-// עדכון דגימה – מותר לבעלים או לאדמין בלבד
-app.put('/samples/:id', authenticateToken, async (req, res) => {
+
+// עדכון דגימה – בעלים/אדמין, תומך גם בהעלאת אודיו אופציונלית
+app.put('/samples/:id', authenticateToken, upload.single('audio'), async (req, res) => {
   try {
     const { id } = req.params;
 
-    // ולידציית מזהה
     if (!mongoose.isValidObjectId(id)) {
       return res.status(400).json({ error: 'invalid sample id' });
     }
 
-    // שליפה כדי לבדוק הרשאות (בעלות)
+    // שליפה כדי לבדוק הרשאות
     const sample = await Sample.findById(id);
     if (!sample) {
       return res.status(404).json({ error: 'Sample not found' });
     }
 
-    // הרשאות: בעלים או אדמין
     const isOwner = sample.owner && sample.owner.toString() === req.user.userId;
-    const isAdmin = req.user.role === 'admin';
-    if (!isOwner && !isAdmin) {
+    const isAdminRole = req.user.role === 'admin';
+    if (!isOwner && !isAdminRole) {
       return res.status(403).json({ error: 'forbidden' });
     }
 
-    // עדכון שדות מותרים בלבד
-    const updatable = [
-      'title', 'bpm', 'key', 'genre', 'url',
-      'artist', 'tags', 'length', 'description', 'isPublic'
-    ];
-
+    // עדכון שדות טקסטואליים (מה-FormData או JSON)
+    const body = req.body || {};
+    const updatable = ['title','bpm','key','genre','url','artist','tags','length','description','isPublic'];
     for (const k of updatable) {
-      if (Object.prototype.hasOwnProperty.call(req.body, k)) {
-        sample[k] = req.body[k];
+      if (Object.prototype.hasOwnProperty.call(body, k)) {
+        // המרות קלות
+        if (k === 'bpm') sample[k] = body[k] ? Number(body[k]) : undefined;
+        else if (k === 'isPublic') sample[k] = body[k] === 'true' || body[k] === true;
+        else sample[k] = body[k];
       }
     }
 
-    // שמירה והחזרה
+    // אם עלו קובץ אודיו חדש – נחליף
+    if (req.file && req.file.filename) {
+      sample.audio = req.file.filename; // נשמר ב־uploads/
+    }
+
     const updated = await sample.save();
     return res.json(updated);
 
@@ -157,6 +220,9 @@ app.put('/samples/:id', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: err.message });
   }
 });
+
+
+
 
 
 // PUT /samples/:sampleId/comments/:commentId – עדכון טקסט של תגובה קיימת (Owner-only)

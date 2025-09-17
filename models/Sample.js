@@ -24,6 +24,7 @@ const sampleSchema = new mongoose.Schema({
   key: { type: String, required: true },
   genre: { type: String, required: true },
   url: { type: String, required: true },
+  audio: { type: String, required: true },  // כאן יישמר שם/נתיב הקובץ בשר
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
 
   // metadata
