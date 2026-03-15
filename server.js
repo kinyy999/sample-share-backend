@@ -78,11 +78,11 @@ app.use(express.json());
 const cors = require('cors');
 
 app.use(cors({
-  origin: 'http://localhost:3001', // ה־frontend 
+  origin: [
+    'http://localhost:3001',
+    'https://sample-share-frontend2-lbc8-nnhagltjx-kiny.vercel.app',
+  ],
 }));
-
-
-
 
 // Routes
 app.get('/', (req, res) => {
@@ -113,7 +113,6 @@ app.post('/samples', authenticateToken, upload.single('audio'), async (req, res)
     res.status(400).json({ error: err.message });
   }
 });
-
 
 app.get('/samples', async (req, res) => {
   try {
