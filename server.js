@@ -81,6 +81,7 @@ app.use(cors({
   origin: [
     'http://localhost:3001',
     'https://sample-share-frontend2-lbc8-nnhagltjx-kiny.vercel.app',
+    'https://sample-share-frontend2-lbc8-76ic62x0w-kiny.vercel.app',
   ],
 }));
 
